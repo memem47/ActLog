@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#17273f">
+<title>ActLog</title>
+<style>
+:root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#1c2838;background:#f4f7fa}
+*{box-sizing:border-box}body{margin:0}main{max-width:860px;margin:auto;padding:18px 16px 70px}
+header{background:#17273f;color:#fff;padding:15px 22px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+header h1{margin:0;font-size:23px}header small{opacity:.75}button,input,textarea{font:inherit}
+button{border:0;border-radius:10px;background:#1f65c3;color:#fff;padding:11px 15px;cursor:pointer;min-height:44px}
+button:disabled{opacity:.5;cursor:wait}.secondary{background:#e8eef6;color:#1b3454}.danger{background:#fae5e4;color:#8e2925}
+.panel{background:#fff;border:1px solid #e1e7ee;border-radius:15px;padding:16px;margin:14px 0}
+h2{font-size:17px;margin:0 0 12px}.muted{color:#637085;font-size:13px}
+input,textarea{width:100%;padding:11px;border:1px solid #cbd5e1;border-radius:9px;background:#fff}
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.activity{background:#f0f5fb;color:#163f78;text-align:left;border:1px solid #d9e5f2;min-height:75px;font-weight:650}
+.activity span{display:block;font-size:12px;font-weight:400;margin-top:5px}
+.flex{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.flex input{flex:1;min-width:130px}
+.log{border-top:1px solid #e5eaf0;padding:12px 0;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.log:first-child{border-top:0}.log small{color:#657287}.log strong{display:block}
+#status{padding:10px 15px;border-radius:8px;background:#eaf1fa;margin-top:12px;white-space:pre-wrap}
+#status.error{background:#fce9e9;color:#8b2424}
+.hidden{display:none}a{color:#1f65c3}textarea{min-height:65px;resize:vertical}
+@media(min-width:650px){.grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/@azure/msal-browser@2.38.3/lib/msal-browser.min.js"></script>
+</head>
+<body>
+<header><div><h1>ActLog</h1><small>行動を、手軽に記録する</small></div><button id="logout" class="secondary hidden">ログアウト</button></header>
+<main>
+<div id="status" role="status" aria-live="polite">Microsoftアプリの設定から始めてください。</div>
+<section class="panel" id="setup">
+<h2>初期設定</h2>
+<p class="muted">Microsoft Entraのアプリ登録で取得した「アプリケーション（クライアント）ID」を入力します。これは公開情報で、パスワードではありません。</p>
+<label for="clientId">クライアントID</label>
+<input id="clientId" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" spellcheck="false">
+<p class="muted">リダイレクトURI: <code id="redirect"></code></p>
+<div class="flex"><button id="saveConfig">設定を保存</button><button id="login">Microsoftでログイン</button></div>
+<p class="muted">個人用Microsoftアカウントを使用し、OneDriveのアプリ専用フォルダへのアクセスを許可します。</p>
+</section>
+<div id="workspace" class="hidden">
+<section class="panel">
+<div class="flex" style="justify-content:space-between"><h2>今日の活動</h2><span id="today" class="muted"></span></div>
+<div id="activities" class="grid"></div>
+<p class="muted">ボタンを押すと、その活動を1回記録します。</p>
+<div class="flex"><input id="newActivity" maxlength="40" placeholder="活動項目を追加"><button id="addActivity" class="secondary">項目追加</button></div>
+</section>
+<section class="panel"><h2>メモ付きで記録</h2>
+<label for="activitySelect" class="muted">活動</label><select id="activitySelect" style="width:100%;min-height:44px;margin:6px 0 10px"></select>
+<label for="note" class="muted">何をしたか（任意）</label><textarea id="note" maxlength="1000" placeholder="例：Edenomalyの家系図を修正"></textarea>
+<div class="flex" style="margin-top:10px"><button id="saveNote">記録する</button><button id="refresh" class="secondary">最新状態を取得</button></div></section>
+<section class="panel"><div class="flex" style="justify-content:space-between"><h2>最近の記録</h2><button class="secondary" id="export">JSON出力</button></div>
+<div id="logs"></div></section>
+</div>
+</main>
+<script>
+"use strict";
+const GRAPH="https://graph.microsoft.com/v1.0";
+const SCOPES=["Files.ReadWrite.AppFolder"];
+const FILENAME="actlog.json";
+const defaults=["英語音読","英単語","AI学習","プログラミング","ゲーム開発","読書","運動"];
+const $=id=>document.getElementById(id);
+const redirectUri=location.origin+location.pathname;
+$("redirect").textContent=redirectUri;
+$("clientId").value=localStorage.getItem("actlog-client-id")||"";
+let msalApp=null,account=null,data=null,busy=false;
+function status(message,error=false){$("status").textContent=message;$("status").classList.toggle("error",error)}
+function localDate(d=new Date()){return new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Tokyo",year:"numeric",month:"2-digit",day:"2-digit"}).format(d)}
+function fresh(){return {version:1,activities:[...defaults],logs:[]}}
+function validateId(v){return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)}
+function configure(){
+ const id=$("clientId").value.trim();
+ if(!validateId(id))throw Error("クライアントIDの形式が正しくありません。");
+ msalApp=new msal.PublicClientApplication({auth:{clientId:id,authority:"https://login.microsoftonline.com/consumers",redirectUri},cache:{cacheLocation:"sessionStorage"}});
+ localStorage.setItem("actlog-client-id",id);
+}
+async function token(){
+ if(!msalApp||!account)throw Error("ログインしてください。");
+ try{return (await msalApp.acquireTokenSilent({scopes:SCOPES,account})).accessToken}
+ catch(e){return (await msalApp.acquireTokenPopup({scopes:SCOPES,account})).accessToken}
+}
+async function graph(path,options={}){
+ const t=await token();const headers=new Headers(options.headers||{});
+ headers.set("Authorization","Bearer "+t);
+ const response=await fetch(GRAPH+path,{...options,headers});
+ return response;
+}
+async function metadata(){
+ const response=await graph("/me/drive/special/approot:/"+FILENAME+"?$select=id,eTag,@microsoft.graph.downloadUrl");
+ if(response.status===404)return null;
+ if(!response.ok)throw Error("OneDriveファイルの確認に失敗しました ("+response.status+")");
+ return await response.json();
+}
+async function readCloud(){
+ const file=await metadata();
+ if(!file)return {value:fresh(),etag:null};
+ let response;
+ const url=file["@microsoft.graph.downloadUrl"];
+ if(url){try{response=await fetch(url,{cache:"no-store"})}catch(e){response=null}}
+ if(!response||!response.ok)response=await graph("/me/drive/items/"+encodeURIComponent(file.id)+"/content");
+ if(!response.ok)throw Error("OneDriveの読み込みに失敗しました ("+response.status+")");
+ const value=await response.json();
+ if(value.version!==1||!Array.isArray(value.activities)||!Array.isArray(value.logs))throw Error("保存データの形式が不正です。上書きせず停止しました。");
+ return {value,etag:file.eTag};
+}
+async function writeCloud(value,etag){
+ const headers={"Content-Type":"application/json; charset=utf-8"};
+ if(etag)headers["If-Match"]=etag;else headers["If-None-Match"]="*";
+ const response=await graph("/me/drive/special/approot:/"+FILENAME+":/content",
+   {method:"PUT",headers,body:JSON.stringify(value,null,2)});
+ if(response.status===409||response.status===412)throw Error("別の端末で記録が更新されました。上書きしていません。『最新状態を取得』を押してからやり直してください。");
+ if(!response.ok)throw Error("OneDriveへの保存に失敗しました ("+response.status+"): "+(await response.text()).slice(0,180));
+}
+async function refresh(){
+ const state=await readCloud();data=state.value;render();
+ status("OneDriveと同期しました。");
+}
+async function change(mutator){
+ if(busy)return;
+ busy=true;toggleBusy(true);
+ try{
+   const latest=await readCloud();
+   const next=structuredClone(latest.value);
+   mutator(next);
+   if(JSON.stringify(next)===JSON.stringify(latest.value)){data=latest.value;render();status("変更はありません。");return}
+   await writeCloud(next,latest.etag);
+   data=next;render();status("OneDriveに保存しました。");
+ }catch(e){status(e.message,true)}
+ finally{busy=false;toggleBusy(false)}
+}
+function toggleBusy(value){document.querySelectorAll("#workspace button").forEach(b=>b.disabled=value)}
+function addLog(name,note=""){
+ return change(d=>d.logs.push({id:crypto.randomUUID(),activity:name,at:new Date().toISOString(),note:note.trim()}))
+}
+function elt(tag,text,className){const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(className)n.className=className;return n}
+function render(){
+ if(!data)return;
+ $("today").textContent=localDate();
+ const counts={};for(const l of data.logs){if(localDate(new Date(l.at))===localDate())counts[l.activity]=(counts[l.activity]||0)+1}
+ $("activities").replaceChildren();$("activitySelect").replaceChildren();
+ for(const name of data.activities){
+   const b=elt("button",name,"activity");
+   b.append(elt("span","今日 "+(counts[name]||0)+" 回"));b.onclick=()=>addLog(name);
+   $("activities").append(b);
+   const option=elt("option",name);option.value=name;$("activitySelect").append(option);
+ }
+ $("logs").replaceChildren();
+ const sorted=[...data.logs].sort((a,b)=>b.at.localeCompare(a.at)).slice(0,50);
+ if(!sorted.length)$("logs").append(elt("p","まだ記録はありません。","muted"));
+ for(const entry of sorted){
+   const row=elt("div",undefined,"log"),body=elt("div"),actions=elt("div",undefined,"flex");
+   body.append(elt("strong",entry.activity),elt("small",new Date(entry.at).toLocaleString("ja-JP",{timeZone:"Asia/Tokyo"})));
+   if(entry.note)body.append(elt("div",entry.note));
+   const edit=elt("button","編集","secondary"),del=elt("button","削除","danger");
+   edit.onclick=()=>{const note=prompt("メモを編集",entry.note||"");if(note===null)return;
+      change(d=>{const item=d.logs.find(x=>x.id===entry.id);if(!item)throw Error("対象の記録が見つかりません。");item.note=note.slice(0,1000)})};
+   del.onclick=()=>{if(confirm("この記録を削除しますか？"))change(d=>{d.logs=d.logs.filter(x=>x.id!==entry.id)})};
+   actions.append(edit,del);row.append(body,actions);$("logs").append(row);
+ }
+}
+$("saveConfig").onclick=()=>{try{configure();status("設定を保存しました。Microsoftでログインしてください。")}catch(e){status(e.message,true)}};
+$("login").onclick=async()=>{
+ try{configure();if(typeof msal==="undefined")throw Error("認証ライブラリを読み込めませんでした。ネット接続を確認してください。");
+  const result=await msalApp.loginPopup({scopes:SCOPES,prompt:"select_account"});
+  account=result.account;$("setup").classList.add("hidden");$("workspace").classList.remove("hidden");$("logout").classList.remove("hidden");
+  await refresh();
+ }catch(e){status("ログインまたは同期に失敗: "+e.message,true)}
+};
+$("logout").onclick=async()=>{if(msalApp&&account)await msalApp.logoutPopup({account,postLogoutRedirectUri:redirectUri});account=null;data=null;$("setup").classList.remove("hidden");$("workspace").classList.add("hidden");$("logout").classList.add("hidden");status("ログアウトしました。")};
+$("addActivity").onclick=()=>{const name=$("newActivity").value.trim();if(!name)return;
+ change(d=>{if(d.activities.includes(name))throw Error("同じ活動項目があります。");d.activities.push(name)}).then(()=>{$("newActivity").value=""})};
+$("saveNote").onclick=()=>{const name=$("activitySelect").value;if(name)addLog(name,$("note").value).then(()=>{if($("status").classList.contains("error")===false)$("note").value=""})};
+$("refresh").onclick=async()=>{try{await refresh()}catch(e){status(e.message,true)}};
+$("export").onclick=()=>{if(!data)return;const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});const url=URL.createObjectURL(blob);const a=document.createElement("a");a.href=url;a.download="actlog-"+localDate()+".json";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000)};
+if($("clientId").value){try{configure();status("設定が見つかりました。Microsoftでログインしてください。")}catch(e){status(e.message,true)}}
+</script></body></html>
